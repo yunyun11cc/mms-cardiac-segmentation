@@ -1,0 +1,18 @@
+# 数据集（太大，不上传）
+dataset/
+training_labeled.tar.gz
+
+# Python 虚拟环境
+.venv/
+__pycache__/
+*.pyc
+
+# 输出文件（图片、模型权重、CSV 都在这里）
+outputs/
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
