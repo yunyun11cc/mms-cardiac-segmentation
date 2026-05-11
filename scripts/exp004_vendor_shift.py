@@ -29,8 +29,6 @@ from monai.transforms import (
 from monai.networks.nets import BasicUNet
 from monai.losses import DiceLoss
 from monai.data import DataLoader, Dataset
-from monai.metrics import DiceMetric
-
 import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -141,7 +139,7 @@ def get_cases_by_vendor(vendor_map, vendors):
 # 5. 训练 + 评估
 # ============================================================
 
-def train_and_eval(train_ids, test_ids, split_name, vendor_map, pipeline):
+def train_and_eval(train_ids, test_ids, split_name, pipeline):
     print(f"\n{'='*60}")
     print(f"Split: {split_name}")
     print(f"{'='*60}")
@@ -186,25 +184,33 @@ def train_and_eval(train_ids, test_ids, split_name, vendor_map, pipeline):
                 loss.backward()
                 optimizer.step()
 
-    # 评估
+    # 评估 — 手工计算 per-class Dice，避免 MONAI DiceMetric 版本兼容问题
     model.eval()
-    dice_metric = DiceMetric(include_background=False, reduction="mean_batch")
+    inter = torch.zeros(4, device=DEVICE)  # 每个类别的 intersection 累加
+    total = torch.zeros(4, device=DEVICE)  # 每个类别的 prediction+GT 累加
     with torch.no_grad():
         for batch in test_loader:
             x, y = batch["image"].to(DEVICE), batch["label"].to(DEVICE)
-            y_pred = torch.softmax(model(x), dim=1)
-            # y: [B, 1, H, W] → squeeze → [B, H, W] → one_hot → [B, H, W, 4] → permute → [B, 4, H, W]
-            y_onehot = torch.nn.functional.one_hot(
-                y.squeeze(1).long(), num_classes=4
-            ).permute(0, 3, 1, 2)
-            dice_metric(y_pred, y_onehot)
+            logits = model(x)                          # [B, 4, H, W]
+            y_pred = torch.argmax(logits, dim=1)       # [B, H, W]
+            y_true = y.squeeze(1).long()               # [B, H, W]
 
-    dice_per_class = dice_metric.aggregate().cpu().numpy()  # [LV, RV, MYO] (bg excluded)
-    dice_avg = np.mean(dice_per_class)
-    print(f"  Dice: LV={dice_per_class[0]:.4f}, RV={dice_per_class[1]:.4f}, MYO={dice_per_class[2]:.4f}")
+            for c in range(1, 4):  # 只算 LV(1), RV(2), MYO(3), 跳过 background(0)
+                pred_c = (y_pred == c)
+                gt_c = (y_true == c)
+                inter[c] += (pred_c & gt_c).sum().float()
+                total[c] += pred_c.sum().float() + gt_c.sum().float()
+
+    dice_scores = np.zeros(3)
+    for i, c in enumerate([1, 2, 3]):
+        if total[c] > 0:
+            dice_scores[i] = 2 * inter[c].item() / total[c].item()
+
+    dice_avg = np.mean(dice_scores)
+    print(f"  Dice: LV={dice_scores[0]:.4f}, RV={dice_scores[1]:.4f}, MYO={dice_scores[2]:.4f}")
     print(f"  Avg Dice: {dice_avg:.4f}")
 
-    return {"name": split_name, "dice": dice_per_class, "avg": dice_avg}
+    return {"name": split_name, "dice": dice_scores, "avg": dice_avg}
 
 
 # ============================================================
@@ -299,7 +305,7 @@ def main():
 
     results = []
     for name, train_ids, test_ids in splits:
-        r = train_and_eval(train_ids, test_ids, name, vendor_map, pipeline)
+        r = train_and_eval(train_ids, test_ids, name, pipeline)
         if r:
             results.append(r)
 
@@ -314,7 +320,7 @@ def main():
     # 用 80% 训练，20% 验证
     split_idx = int(len(all_train) * 0.8)
     ref = train_and_eval(all_train[:split_idx], all_train[split_idx:],
-                         "Mixed (Siemens+Philips)", vendor_map, pipeline)
+                         "Mixed (Siemens+Philips)", pipeline)
     if ref:
         results.append(ref)
         plot_results(results, OUTPUT_ROOT / "exp004_dice_barplot.png")
