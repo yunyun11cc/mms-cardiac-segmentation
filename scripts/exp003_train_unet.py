@@ -331,7 +331,7 @@ def main():
     ).to(DEVICE)
 
     # 训练
-    EPOCHS = 10
+    EPOCHS = 30
     n_batches = len(train_loader)
     print(f"\n开始训练 ({EPOCHS} epochs, 每 epoch {n_batches} 个 batch)...")
     print(f"  第一次 epoch 会比较慢（CPU 上约 2-5 分钟），之后会好一些")
