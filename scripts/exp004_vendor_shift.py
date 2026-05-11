@@ -16,12 +16,11 @@ Exp004: Vendor Shift 实验 — Leave-One-Vendor-Out
 
 from pathlib import Path
 import csv
-import warnings
-warnings.filterwarnings("ignore")
 
 import nibabel as nib
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from monai.transforms import (
     Compose, EnsureChannelFirstd, Spacingd,
@@ -31,7 +30,6 @@ from monai.networks.nets import BasicUNet
 from monai.losses import DiceLoss
 from monai.data import DataLoader, Dataset
 from monai.metrics import DiceMetric
-from monai.utils import set_determinism
 
 import matplotlib.pyplot as plt
 
@@ -108,7 +106,7 @@ def load_vendor_slices(case_ids, pipeline):
             lbl_nii = nib.load(str(lbl_path))
             img_4d = img_nii.get_fdata()
             lbl_4d = lbl_nii.get_fdata()
-        except:
+        except Exception:
             continue
 
         img_3d, lbl_3d, _ = select_ed_frame(img_4d, lbl_4d)
@@ -117,16 +115,18 @@ def load_vendor_slices(case_ids, pipeline):
             out = pipeline({"image": img_3d, "label": lbl_3d})
             vol_img = out["image"].numpy()
             vol_lbl = out["label"].numpy()
-        except:
+        except Exception:
             continue
 
+        n_before = len(images)
         for z in range(vol_lbl.shape[-1]):
             lbl_slice = vol_lbl[0, :, :, z]
             if np.sum(lbl_slice > 0) > 20:
                 images.append(vol_img[:, :, :, z].copy())      # [1, 256, 256]
                 labels.append(lbl_slice[None, :, :].copy())   # [1, 256, 256]
+        n_this = len(images) - n_before
 
-        print(f"    {case_id}: {vol_img.shape} → {len(images)} slices total")
+        print(f"    {case_id}: {vol_img.shape} → {n_this} slices")
 
     print(f"  → {len(images)} slices")
     return images, labels
@@ -168,10 +168,9 @@ def train_and_eval(train_ids, test_ids, split_name, vendor_map, pipeline):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     scaler = torch.cuda.amp.GradScaler() if DEVICE == "cuda" else None
 
-    from tqdm import tqdm
     for epoch in tqdm(range(10), desc=f"  {split_name}"):
         model.train()
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc="    Train", leave=False):
             x, y = batch["image"].to(DEVICE), batch["label"].to(DEVICE)
             optimizer.zero_grad()
             if scaler:
@@ -194,12 +193,15 @@ def train_and_eval(train_ids, test_ids, split_name, vendor_map, pipeline):
         for batch in test_loader:
             x, y = batch["image"].to(DEVICE), batch["label"].to(DEVICE)
             y_pred = torch.softmax(model(x), dim=1)
-            y_onehot = torch.nn.functional.one_hot(y[:, 0].long(), num_classes=4).permute(0, 3, 1, 2)
+            # y: [B, 1, H, W] → squeeze → [B, H, W] → one_hot → [B, H, W, 4] → permute → [B, 4, H, W]
+            y_onehot = torch.nn.functional.one_hot(
+                y.squeeze(1).long(), num_classes=4
+            ).permute(0, 3, 1, 2)
             dice_metric(y_pred, y_onehot)
 
-    dice_per_class = dice_metric.aggregate().cpu().numpy()
+    dice_per_class = dice_metric.aggregate().cpu().numpy()  # [LV, RV, MYO] (bg excluded)
     dice_avg = np.mean(dice_per_class)
-    print(f"  Dice: LV={dice_per_class[1]:.4f}, RV={dice_per_class[2]:.4f}, MYO={dice_per_class[3]:.4f}")
+    print(f"  Dice: LV={dice_per_class[0]:.4f}, RV={dice_per_class[1]:.4f}, MYO={dice_per_class[2]:.4f}")
     print(f"  Avg Dice: {dice_avg:.4f}")
 
     return {"name": split_name, "dice": dice_per_class, "avg": dice_avg}
@@ -212,9 +214,9 @@ def train_and_eval(train_ids, test_ids, split_name, vendor_map, pipeline):
 def plot_results(results, save_path):
     """柱状图对比各 Split 的 Dice"""
     names = [r["name"] for r in results]
-    lv = [r["dice"][1] for r in results]
-    rv = [r["dice"][2] for r in results]
-    myo = [r["dice"][3] for r in results]
+    lv = [r["dice"][0] for r in results]
+    rv = [r["dice"][1] for r in results]
+    myo = [r["dice"][2] for r in results]
 
     x = np.arange(len(names))
     w = 0.22
@@ -264,7 +266,7 @@ def save_results_table(results, save_path):
     lines.append(f"{'Split':<25} {'LV':<8} {'RV':<8} {'MYO':<8} {'Avg':<8}")
     lines.append("-" * 50)
     for r in results:
-        lv, rv, myo = r["dice"][1], r["dice"][2], r["dice"][3]
+        lv, rv, myo = r["dice"][0], r["dice"][1], r["dice"][2]
         lines.append(f"{r['name']:<25} {lv:<8.4f} {rv:<8.4f} {myo:<8.4f} {r['avg']:<8.4f}")
     with open(save_path, "w") as f:
         f.write("\n".join(lines))
