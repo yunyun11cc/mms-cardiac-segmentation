@@ -188,7 +188,7 @@ def train_and_eval(train_ids, test_ids, split_name, vendor_map, pipeline):
 
     # 评估
     model.eval()
-    dice_metric = DiceMetric(include_background=False, reduction="mean_per_channel")
+    dice_metric = DiceMetric(include_background=False, reduction="mean_batch")
     with torch.no_grad():
         for batch in test_loader:
             x, y = batch["image"].to(DEVICE), batch["label"].to(DEVICE)
