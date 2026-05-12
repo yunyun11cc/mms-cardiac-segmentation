@@ -16,11 +16,12 @@ Exp004: Vendor Shift 实验 — Leave-One-Vendor-Out
 
 from pathlib import Path
 import csv
+import warnings
+warnings.filterwarnings("ignore")
 
 import nibabel as nib
 import numpy as np
 import torch
-from tqdm import tqdm
 
 from monai.transforms import (
     Compose, EnsureChannelFirstd, Spacingd,
@@ -28,7 +29,8 @@ from monai.transforms import (
 )
 from monai.networks.nets import BasicUNet
 from monai.losses import DiceLoss
-from monai.data import DataLoader, Dataset
+from monai.data import DataLoader, Dataset, pad_list_data_collate
+
 import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -116,15 +118,14 @@ def load_vendor_slices(case_ids, pipeline):
         except Exception:
             continue
 
-        n_before = len(images)
         for z in range(vol_lbl.shape[-1]):
             lbl_slice = vol_lbl[0, :, :, z]
             if np.sum(lbl_slice > 0) > 20:
-                images.append(vol_img[:, :, :, z].copy())      # [1, 256, 256]
-                labels.append(lbl_slice[None, :, :].copy())   # [1, 256, 256]
-        n_this = len(images) - n_before
+                images.append(vol_img[:, :, :, z].copy())
+                labels.append(lbl_slice[None, :, :].copy())  # [1, 256, 256]
 
-        print(f"    {case_id}: {vol_img.shape} → {n_this} slices")
+        n_slices = sum(1 for z in range(vol_lbl.shape[-1]) if np.sum(vol_lbl[0, :, :, z] > 0) > 20)
+        print(f"    {case_id}: {vol_img.shape} → {n_slices} slices")
 
     print(f"  → {len(images)} slices")
     return images, labels
@@ -139,7 +140,14 @@ def get_cases_by_vendor(vendor_map, vendors):
 # 5. 训练 + 评估
 # ============================================================
 
-def train_and_eval(train_ids, test_ids, split_name, pipeline):
+def train_and_eval(train_ids, test_ids, split_name, vendor_map, pipeline):
+    import time
+    try:
+        from tqdm import tqdm
+        has_tqdm = True
+    except ImportError:
+        has_tqdm = False
+
     print(f"\n{'='*60}")
     print(f"Split: {split_name}")
     print(f"{'='*60}")
@@ -156,61 +164,69 @@ def train_and_eval(train_ids, test_ids, split_name, pipeline):
 
     train_ds = Dataset(data=[{"image": i, "label": l} for i, l in zip(train_imgs, train_lbls)])
     test_ds = Dataset(data=[{"image": i, "label": l} for i, l in zip(test_imgs, test_lbls)])
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=8, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=0,
+                              collate_fn=pad_list_data_collate)
+    test_loader = DataLoader(test_ds, batch_size=8, shuffle=False, num_workers=0,
+                             collate_fn=pad_list_data_collate)
 
     model = BasicUNet(spatial_dims=2, in_channels=1, out_channels=4,
                       features=(32, 32, 64, 128, 256, 512)).to(DEVICE)
 
     loss_fn = DiceLoss(to_onehot_y=True, softmax=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    scaler = torch.cuda.amp.GradScaler() if DEVICE == "cuda" else None
 
-    for epoch in tqdm(range(10), desc=f"  {split_name}"):
+    # 训练（带进度条）
+    epochs = 6
+    epoch_iter = tqdm(range(epochs), desc="Epoch") if has_tqdm else range(epochs)
+
+    for epoch in epoch_iter:
+        epoch_start = time.time()
         model.train()
-        for batch in tqdm(train_loader, desc="    Train", leave=False):
+        train_loss = 0
+
+        batch_iter = tqdm(train_loader, desc="  Train", leave=False) if has_tqdm else train_loader
+
+        for batch in batch_iter:
             x, y = batch["image"].to(DEVICE), batch["label"].to(DEVICE)
             optimizer.zero_grad()
-            if scaler:
-                with torch.cuda.amp.autocast():
-                    logits = model(x)
-                    loss = loss_fn(logits, y)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                logits = model(x)
-                loss = loss_fn(logits, y)
-                loss.backward()
-                optimizer.step()
+            loss = loss_fn(model(x), y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
 
-    # 评估 — 手工计算 per-class Dice，避免 MONAI DiceMetric 版本兼容问题
+        avg_loss = train_loss / len(train_loader)
+        epoch_time = time.time() - epoch_start
+
+        if has_tqdm:
+            epoch_iter.set_postfix({"loss": f"{avg_loss:.4f}", "time": f"{epoch_time:.0f}s"})
+        else:
+            print(f"  Epoch {epoch+1}/{epochs} | loss={avg_loss:.4f} | {epoch_time:.0f}s")
+
+    # 评估（手写 Dice，不依赖 MONAI DiceMetric 版本兼容）
     model.eval()
-    inter = torch.zeros(4, device=DEVICE)  # 每个类别的 intersection 累加
-    total = torch.zeros(4, device=DEVICE)  # 每个类别的 prediction+GT 累加
+    dice_sums = torch.zeros(3, device=DEVICE)  # LV, RV, MYO
+    dice_counts = 0
     with torch.no_grad():
         for batch in test_loader:
             x, y = batch["image"].to(DEVICE), batch["label"].to(DEVICE)
-            logits = model(x)                          # [B, 4, H, W]
-            y_pred = torch.argmax(logits, dim=1)       # [B, H, W]
-            y_true = y.squeeze(1).long()               # [B, H, W]
+            logits = model(x)                           # [B, 4, H, W]
+            y_pred = torch.argmax(logits, dim=1)         # [B, H, W]
+            y_true = y[:, 0].long()                      # [B, H, W]
 
-            for c in range(1, 4):  # 只算 LV(1), RV(2), MYO(3), 跳过 background(0)
+            for c in range(1, 4):  # class 1=LV, 2=RV, 3=MYO
                 pred_c = (y_pred == c)
-                gt_c = (y_true == c)
-                inter[c] += (pred_c & gt_c).sum().float()
-                total[c] += pred_c.sum().float() + gt_c.sum().float()
+                true_c = (y_true == c)
+                inter = (pred_c & true_c).sum().float()
+                dice = (2 * inter + 1e-6) / (pred_c.sum() + true_c.sum() + 1e-6)
+                dice_sums[c - 1] += dice
+            dice_counts += 1
 
-    dice_scores = np.zeros(3)
-    for i, c in enumerate([1, 2, 3]):
-        if total[c] > 0:
-            dice_scores[i] = 2 * inter[c].item() / total[c].item()
-
-    dice_avg = np.mean(dice_scores)
-    print(f"  Dice: LV={dice_scores[0]:.4f}, RV={dice_scores[1]:.4f}, MYO={dice_scores[2]:.4f}")
+    dice_per_class = dice_sums.cpu().numpy() / dice_counts
+    dice_avg = np.mean(dice_per_class)
+    print(f"  Dice: LV={dice_per_class[0]:.4f}, RV={dice_per_class[1]:.4f}, MYO={dice_per_class[2]:.4f}")
     print(f"  Avg Dice: {dice_avg:.4f}")
 
-    return {"name": split_name, "dice": dice_scores, "avg": dice_avg}
+    return {"name": split_name, "dice": dice_per_class, "avg": dice_avg}
 
 
 # ============================================================
@@ -225,43 +241,22 @@ def plot_results(results, save_path):
     myo = [r["dice"][2] for r in results]
 
     x = np.arange(len(names))
-    w = 0.22
+    w = 0.25
 
-    # 自动计算 y 轴范围，留 20% 顶部空间放数值标注
-    all_vals = lv + rv + myo
-    y_max = max(all_vals) * 1.5 if max(all_vals) > 0 else 1.0
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-
-    bars1 = ax.bar(x - w, lv, w, label="LV", color="#2E86AB")
-    bars2 = ax.bar(x, rv, w, label="RV", color="#A23B72")
-    bars3 = ax.bar(x + w, myo, w, label="MYO", color="#F18F01")
-
-    # 柱顶标数值
-    def add_labels(bars):
-        for bar in bars:
-            h = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., h + y_max*0.02,
-                    f'{h:.4f}', ha='center', va='bottom', fontsize=9)
-
-    add_labels(bars1)
-    add_labels(bars2)
-    add_labels(bars3)
-
-    # 缩短 x 轴标签（太长会重叠）
-    short_names = [n.replace("Train ", "").replace("Test ", "").replace("Siemens+Philips", "Siem+Phi")
-                   .replace("Mixed (Siemens+Philips)", "Mixed\n(Siem+Phi)") for n in names]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(x - w, lv, w, label="LV")
+    ax.bar(x, rv, w, label="RV")
+    ax.bar(x + w, myo, w, label="MYO")
     ax.set_xticks(x)
-    ax.set_xticklabels(short_names, fontsize=10)
-
-    ax.set_ylabel("Dice Score", fontsize=12)
-    ax.set_ylim(0, y_max)
-    ax.legend(fontsize=11, loc="upper right")
-    ax.set_title("Leave-One-Vendor-Out — Per-Class Dice", fontsize=14, fontweight="bold")
-    ax.grid(axis="y", alpha=0.3)
+    ax.set_xticklabels(names)
+    ax.set_ylabel("Dice")
+    ax.set_ylim(0, 1)
+    ax.axhline(y=0.8, color="gray", linestyle="--", alpha=0.5)
+    ax.legend()
+    ax.set_title("Leave-One-Vendor-Out Dice Comparison")
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=180, bbox_inches="tight")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"柱状图保存: {save_path}")
 
@@ -305,7 +300,7 @@ def main():
 
     results = []
     for name, train_ids, test_ids in splits:
-        r = train_and_eval(train_ids, test_ids, name, pipeline)
+        r = train_and_eval(train_ids, test_ids, name, vendor_map, pipeline)
         if r:
             results.append(r)
 
@@ -320,7 +315,7 @@ def main():
     # 用 80% 训练，20% 验证
     split_idx = int(len(all_train) * 0.8)
     ref = train_and_eval(all_train[:split_idx], all_train[split_idx:],
-                         "Mixed (Siemens+Philips)", pipeline)
+                         "Mixed (Siemens+Philips)", vendor_map, pipeline)
     if ref:
         results.append(ref)
         plot_results(results, OUTPUT_ROOT / "exp004_dice_barplot.png")

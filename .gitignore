@@ -1,6 +1,8 @@
 # 数据集（太大，不上传）
 dataset/
 training_labeled.tar.gz
+dataset.zip
+mms_data.zip
 
 # Python 虚拟环境
 .venv/
