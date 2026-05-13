@@ -35,7 +35,7 @@ from monai.transforms import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATASET_ROOT = PROJECT_ROOT / "dataset"
-OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "exp002"
+OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "unet" / "exp002"
 CSV_PATH = DATASET_ROOT / "211230_M&Ms_Dataset_information_diagnosis_opendataset.csv"
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 

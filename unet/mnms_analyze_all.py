@@ -6,8 +6,8 @@
   2. CSV 文件在 dataset/ 下
 
 输出：
-  - outputs/mnms_all_summary.csv (全部 150 例的 shape/spacing/vendor 信息)
-  - outputs/vendor_comparison.png  (不同 vendor 的图像对比图)
+  - outputs/unet/exp001/mnms_all_summary.csv (全部 150 例的 shape/spacing/vendor 信息)
+  - outputs/unet/exp001/vendor_comparison.png  (不同 vendor 的图像对比图)
   - 终端打印统计结果
 """
 
@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATASET_ROOT = PROJECT_ROOT / "dataset"
-OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "exp001"
+OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "unet" / "exp001"
 
 CSV_PATH = DATASET_ROOT / "211230_M&Ms_Dataset_information_diagnosis_opendataset.csv"
 

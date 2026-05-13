@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 # 1. 工程路径设置
 # ============================================================
 # 当前脚本位置：
-# M&Ms/scripts/mnms_first_step.py
+# M&Ms/unet/mnms_first_step.py
 #
 # PROJECT_ROOT:
 # M&Ms/
@@ -19,13 +19,13 @@ import matplotlib.pyplot as plt
 # M&Ms/dataset/
 #
 # OUTPUT_ROOT:
-# M&Ms/outputs/
+# M&Ms/outputs/unet/
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DATASET_ROOT = PROJECT_ROOT / "dataset"
-OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "exp001"
+OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "unet" / "exp001"
 
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
